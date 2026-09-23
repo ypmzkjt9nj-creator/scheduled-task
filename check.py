@@ -10,6 +10,8 @@ import re
 import sys
 import json
 import hashlib
+from datetime import date
+from calendar import monthrange
 from pathlib import Path
 
 import requests
@@ -20,7 +22,8 @@ NTFY_SERVER = os.environ.get("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
 RUN_MODE = os.environ.get("RUN_MODE", "check").strip().lower()
 
-SCAN_STEPS = 3            # current view plus two forward steps
+WINDOW_MONTHS = 3         # how far ahead to look
+WEEK_CAP = 14             # safety cap on week steps
 STATE_FILE = Path("state.json")
 
 USER_AGENT = (
@@ -54,7 +57,6 @@ def notify(title, message, priority="high", tags="bell"):
 
 
 def notify_file(path, title="debug view"):
-    """Send an image privately to the ntfy topic (used by debug mode only)."""
     if not NTFY_TOPIC:
         print("NTFY_TOPIC not set; skipping file send.")
         return
@@ -90,7 +92,27 @@ def sig_of(items):
     return hashlib.sha256("|".join(sorted(items)).encode("utf-8")).hexdigest()
 
 
-# --- generic form / grid navigation ----------------------------------------
+# --- dates -----------------------------------------------------------------
+
+def add_months(d, n):
+    m = d.month - 1 + n
+    y = d.year + m // 12
+    m = m % 12 + 1
+    return date(y, m, min(d.day, monthrange(y, m)[1]))
+
+
+def parse_date(s):
+    m = re.fullmatch(r"(\d{2})\.(\d{2})\.(\d{4})", (s or "").strip())
+    if not m:
+        return None
+    dd, mm, yy = map(int, m.groups())
+    try:
+        return date(yy, mm, dd)
+    except Exception:
+        return None
+
+
+# --- generic form navigation -----------------------------------------------
 
 FORWARD = re.compile(
     r"(appointment|next|continue|forward|proceed|confirm|search|show|select|choose|»|>)",
@@ -103,11 +125,6 @@ GRID_HINT = re.compile(
     r"october|november|december)\s+\d{4})",
     re.I,
 )
-EMPTY_HINT = re.compile(
-    r"(no available|no times|none available|fully booked|not available|no appointments)",
-    re.I,
-)
-MATCH_HINT = re.compile(r"(available|selectable|bookable|free)", re.I)
 
 
 def switch_to_english(page):
@@ -199,7 +216,7 @@ def reach_grid(page):
         check_all_checkboxes(page)
         select_radios(page)
         if looks_like_grid(page):
-            print(f"reached grid at step {step}")
+            print(f"reached calendar at step {step}")
             return True
         if not click_forward(page):
             print(f"no forward control at step {step}")
@@ -207,73 +224,86 @@ def reach_grid(page):
     return looks_like_grid(page)
 
 
-# --- match extraction (most likely to need one tuning pass) ----------------
+# --- calendar controls and slot reading ------------------------------------
 
-def view_label(page):
-    try:
-        text = page.inner_text("body")
-    except Exception:
-        return ""
-    m = re.search(
-        r"((january|february|march|april|may|june|july|august|september|"
-        r"october|november|december)\s+\d{4})",
-        text,
-        re.I,
-    )
-    return m.group(1) if m else ""
-
-
-def extract_matches(page):
-    try:
-        body = page.inner_text("body")
-    except Exception:
-        body = ""
-    if EMPTY_HINT.search(body):
-        return []
-    found = []
-    for selector in [
-        "table a", "table button", "td a",
-        "[class*='calendar'] a", "[class*='calendar'] button", "[class*='day'] a",
+def click_first_available(page):
+    for loc in [
+        page.get_by_role("button", name=re.compile(r"first available", re.I)),
+        page.get_by_role("link", name=re.compile(r"first available", re.I)),
     ]:
-        loc = page.locator(selector)
-        for i in range(min(loc.count(), 80)):
+        try:
+            if loc.count() > 0 and loc.first.is_visible():
+                loc.first.click(timeout=8000)
+                page.wait_for_load_state("networkidle", timeout=25000)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def click_next_week(page):
+    for loc in [
+        page.get_by_role("link", name=re.compile(r"next week", re.I)),
+        page.get_by_role("button", name=re.compile(r"next week", re.I)),
+    ]:
+        try:
+            if loc.count() > 0 and loc.first.is_visible():
+                loc.first.click(timeout=8000)
+                page.wait_for_load_state("networkidle", timeout=25000)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def current_date(page):
+    inputs = page.locator("input")
+    for i in range(min(inputs.count(), 50)):
+        try:
+            v = inputs.nth(i).get_attribute("value") or ""
+            if re.fullmatch(r"\d{2}\.\d{2}\.\d{4}", v):
+                return v
+        except Exception:
+            continue
+    return ""
+
+
+def collect_slots(page):
+    """Return sorted unique bookable times (green cells are clickable HH:MM)."""
+    found = []
+    for sel in ["a", "button", "input[type=submit]", "input[type=button]", "[onclick]", "[role=button]"]:
+        loc = page.locator(sel)
+        for i in range(min(loc.count(), 300)):
             el = loc.nth(i)
             try:
                 if not el.is_visible():
                     continue
-                label = (el.inner_text() or "").strip()
-                cls = el.get_attribute("class") or ""
-                if re.fullmatch(r"\d{1,2}", label) or MATCH_HINT.search(cls):
-                    if label and label not in found:
-                        found.append(label)
+                txt = (el.inner_text() or "").strip() or (el.get_attribute("value") or "").strip()
+                if re.fullmatch(r"\d{1,2}:\d{2}", txt):
+                    found.append(txt)
             except Exception:
                 continue
-    return found
+    return sorted(set(found))
 
 
-def scan(page):
-    items = []
-    for _ in range(SCAN_STEPS):
-        label = view_label(page)
-        matches = extract_matches(page)
-        if matches:
-            items.append(f"{label}: {', '.join(matches)}" if label else ", ".join(matches))
-        moved = False
-        for loc in [
-            page.get_by_role("link", name=re.compile(r"(next|forward|»|>)", re.I)),
-            page.get_by_role("button", name=re.compile(r"(next|forward|»|>)", re.I)),
-        ]:
-            try:
-                if loc.count() > 0 and loc.first.is_visible():
-                    loc.first.click(timeout=5000)
-                    page.wait_for_load_state("networkidle", timeout=20000)
-                    moved = True
-                    break
-            except Exception:
-                continue
-        if not moved:
+def find_all(page):
+    """Jump to first opening, then list every slot within the window."""
+    click_first_available(page)
+    end = add_months(date.today(), WINDOW_MONTHS)
+    results = []
+    for _ in range(WEEK_CAP):
+        dv = current_date(page)
+        d = parse_date(dv)
+        if d and d > end:
             break
-    return items
+        times = collect_slots(page)
+        if times:
+            results.append(f"{dv or 'this week'}: {', '.join(times)}")
+        elif not results:
+            break  # first opening is empty means nothing anywhere
+        if not click_next_week(page):
+            break
+    return results
 
 
 # --- run modes -------------------------------------------------------------
@@ -290,34 +320,42 @@ def run_check(debug=False):
         reached = reach_grid(page)
 
         if debug:
-            shot = "/tmp/view.png"
+            click_first_available(page)
             try:
-                page.screenshot(path=shot, full_page=True)
-                notify_file(shot)
+                page.screenshot(path="/tmp/view.png", full_page=True)
+                notify_file("/tmp/view.png")
             except Exception as e:
                 print(f"debug capture failed: {e}")
+            times = collect_slots(page)
+            notify(
+                "debug",
+                "reached calendar: " + ("yes" if reached else "no")
+                + "\ndetected this week: " + (", ".join(times) if times else "none"),
+                priority="default",
+                tags="eye",
+            )
             browser.close()
             return
 
         if not reached:
-            print("did not reach grid")
+            print("did not reach calendar")
             browser.close()
             sys.exit(1)
 
-        items = scan(page)
+        results = find_all(page)
         browser.close()
 
-    if not items:
+    if not results:
         print("nothing found")
         save_sig("")
         return
 
-    sig = sig_of(items)
+    sig = sig_of(results)
     if sig == load_prev():
         print("unchanged")
         return
 
-    message = "Availability found:\n\n" + "\n".join(items) + "\n\nTap to open."
+    message = "Availability found:\n\n" + "\n".join(results) + "\n\nTap to open."
     notify("Availability found", message, priority="urgent", tags="rotating_light")
     save_sig(sig)
     print("notified")
