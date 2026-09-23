@@ -97,8 +97,10 @@ FORWARD = re.compile(
     re.I,
 )
 GRID_HINT = re.compile(
-    r"(mon|tue|wed|thu|fri|sat|sun|january|february|march|april|may|june|"
-    r"july|august|september|october|november|december|available)",
+    r"\b(mon|tue|wed|thu|fri|sat|sun)\b|"
+    r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b|"
+    r"((january|february|march|april|may|june|july|august|september|"
+    r"october|november|december)\s+\d{4})",
     re.I,
 )
 EMPTY_HINT = re.compile(
