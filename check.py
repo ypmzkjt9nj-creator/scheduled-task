@@ -1,8 +1,12 @@
 """Scheduled page watcher.
 
 Opens a target URL in a headless browser, steps through a short form,
-and reports through ntfy when the resulting grid shows selectable items.
+reaches the time page, and reports through ntfy when an opening exists.
 All configuration comes from environment variables. Nothing is hard-coded.
+
+Detection rule: click "first available time". If the page still shows the
+"no available times could be found" message, there is nothing. If that
+message is absent while still on the time page, an opening exists.
 """
 
 import os
@@ -10,8 +14,6 @@ import re
 import sys
 import json
 import hashlib
-from datetime import date
-from calendar import monthrange
 from pathlib import Path
 
 import requests
@@ -22,8 +24,28 @@ NTFY_SERVER = os.environ.get("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
 RUN_MODE = os.environ.get("RUN_MODE", "check").strip().lower()
 
-WINDOW_MONTHS = 3         # how far ahead to look
-WEEK_CAP = 14             # safety cap on week steps
+# Phrases that mean "nothing available". Matched only inside the results
+# panel (after the "available times" heading) so the page's help text, which
+# always mentions "no available appointments", never false-triggers.
+EMPTY_PATTERNS = [
+    "could be found",
+    "no available",
+    "no times",
+    "no appointments",
+    "no slots",
+    "none available",
+    "not available",
+    "fully booked",
+    "no free",
+]
+# Used only if the results heading cannot be located. Conservative: none of
+# these appear in the page's help text.
+EMPTY_PATTERNS_NARROW = [
+    "could be found",
+    "no available times",
+    "no times available",
+]
+RESULTS_HEADER = "available times"
 STATE_FILE = Path("state.json")
 
 USER_AGENT = (
@@ -89,27 +111,7 @@ def save_sig(sig):
 
 
 def sig_of(items):
-    return hashlib.sha256("|".join(sorted(items)).encode("utf-8")).hexdigest()
-
-
-# --- dates -----------------------------------------------------------------
-
-def add_months(d, n):
-    m = d.month - 1 + n
-    y = d.year + m // 12
-    m = m % 12 + 1
-    return date(y, m, min(d.day, monthrange(y, m)[1]))
-
-
-def parse_date(s):
-    m = re.fullmatch(r"(\d{2})\.(\d{2})\.(\d{4})", (s or "").strip())
-    if not m:
-        return None
-    dd, mm, yy = map(int, m.groups())
-    try:
-        return date(yy, mm, dd)
-    except Exception:
-        return None
+    return hashlib.sha256("|".join(items).encode("utf-8")).hexdigest()
 
 
 # --- generic form navigation -----------------------------------------------
@@ -224,27 +226,12 @@ def reach_grid(page):
     return looks_like_grid(page)
 
 
-# --- calendar controls and slot reading ------------------------------------
+# --- availability -----------------------------------------------------------
 
 def click_first_available(page):
     for loc in [
         page.get_by_role("button", name=re.compile(r"first available", re.I)),
         page.get_by_role("link", name=re.compile(r"first available", re.I)),
-    ]:
-        try:
-            if loc.count() > 0 and loc.first.is_visible():
-                loc.first.click(timeout=8000)
-                page.wait_for_load_state("networkidle", timeout=25000)
-                return True
-        except Exception:
-            continue
-    return False
-
-
-def click_next_week(page):
-    for loc in [
-        page.get_by_role("link", name=re.compile(r"next week", re.I)),
-        page.get_by_role("button", name=re.compile(r"next week", re.I)),
     ]:
         try:
             if loc.count() > 0 and loc.first.is_visible():
@@ -269,7 +256,7 @@ def current_date(page):
 
 
 def collect_slots(page):
-    """Return sorted unique bookable times (green cells are clickable HH:MM)."""
+    """Best-effort read of bookable times (clickable HH:MM). May be empty."""
     found = []
     for sel in ["a", "button", "input[type=submit]", "input[type=button]", "[onclick]", "[role=button]"]:
         loc = page.locator(sel)
@@ -286,24 +273,30 @@ def collect_slots(page):
     return sorted(set(found))
 
 
-def find_all(page):
-    """Jump to first opening, then list every slot within the window."""
+def is_empty_message(body):
+    """True only when a 'nothing available' phrase sits in the results panel."""
+    low = (body or "").lower()
+    idx = low.rfind(RESULTS_HEADER)
+    if idx == -1:
+        return any(p in low for p in EMPTY_PATTERNS_NARROW)
+    tail = low[idx:]
+    return any(p in tail for p in EMPTY_PATTERNS)
+
+
+def assess(page):
+    """Return (available, empty_message_shown, earliest_date, times)."""
     click_first_available(page)
-    end = add_months(date.today(), WINDOW_MONTHS)
-    results = []
-    for _ in range(WEEK_CAP):
-        dv = current_date(page)
-        d = parse_date(dv)
-        if d and d > end:
-            break
-        times = collect_slots(page)
-        if times:
-            results.append(f"{dv or 'this week'}: {', '.join(times)}")
-        elif not results:
-            break  # first opening is empty means nothing anywhere
-        if not click_next_week(page):
-            break
-    return results
+    try:
+        body = page.inner_text("body")
+    except Exception:
+        body = ""
+    on_grid = bool(GRID_HINT.search(body))
+    times = collect_slots(page)
+    empty = is_empty_message(body)
+    # Alert unless the results panel positively says there is nothing.
+    # A detected bookable time forces availability regardless of wording.
+    available = on_grid and (bool(times) or not empty)
+    return available, empty, current_date(page), times
 
 
 # --- run modes -------------------------------------------------------------
@@ -319,44 +312,54 @@ def run_check(debug=False):
         switch_to_english(page)
         reached = reach_grid(page)
 
+        if not reached and not debug:
+            print("did not reach calendar")
+            browser.close()
+            sys.exit(1)
+
+        available, empty, dv, times = (False, True, "", [])
+        if reached:
+            available, empty, dv, times = assess(page)
+
         if debug:
-            click_first_available(page)
             try:
                 page.screenshot(path="/tmp/view.png", full_page=True)
                 notify_file("/tmp/view.png")
             except Exception as e:
                 print(f"debug capture failed: {e}")
-            times = collect_slots(page)
             notify(
                 "debug",
-                "reached calendar: " + ("yes" if reached else "no")
-                + "\ndetected this week: " + (", ".join(times) if times else "none"),
+                f"reached: {'yes' if reached else 'no'}\n"
+                f"no-slots message: {'shown' if empty else 'absent'}\n"
+                f"would alert: {'no' if not available else 'YES'}\n"
+                f"earliest: {dv or 'n/a'}\n"
+                f"times: {', '.join(times) if times else 'none'}",
                 priority="default",
                 tags="eye",
             )
             browser.close()
             return
 
-        if not reached:
-            print("did not reach calendar")
-            browser.close()
-            sys.exit(1)
-
-        results = find_all(page)
         browser.close()
 
-    if not results:
+    if not available:
         print("nothing found")
         save_sig("")
         return
 
-    sig = sig_of(results)
+    detail = "Availability found."
+    if dv:
+        detail += f"\nEarliest: {dv}"
+    if times:
+        detail += f"\nTimes: {', '.join(times)}"
+    detail += "\n\nTap to open and book."
+
+    sig = sig_of([dv] + times) if (dv or times) else "available"
     if sig == load_prev():
         print("unchanged")
         return
 
-    message = "Availability found:\n\n" + "\n".join(results) + "\n\nTap to open."
-    notify("Availability found", message, priority="urgent", tags="rotating_light")
+    notify("Availability found", detail, priority="urgent", tags="rotating_light")
     save_sig(sig)
     print("notified")
 
