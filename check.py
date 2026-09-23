@@ -131,6 +131,34 @@ def check_all_checkboxes(page):
             pass
 
 
+def select_radios(page):
+    """Select the first option in each radio group that has none chosen."""
+    radios = page.locator("input[type=radio]")
+    handled = set()
+    for i in range(radios.count()):
+        r = radios.nth(i)
+        try:
+            name = r.get_attribute("name") or ""
+            key = name or f"_{i}"
+            if key in handled:
+                continue
+            handled.add(key)
+            if name:
+                group = page.locator(f'input[type=radio][name="{name}"]')
+                count = group.count()
+                if any(group.nth(j).is_checked() for j in range(count)):
+                    continue
+                target = group.first
+            else:
+                if r.is_checked():
+                    continue
+                target = r
+            if target.is_visible():
+                target.check(force=True, timeout=3000)
+        except Exception:
+            continue
+
+
 def set_first_count_to_one(page):
     selects = page.locator("select")
     for i in range(selects.count()):
@@ -169,6 +197,7 @@ def reach_grid(page):
     for step in range(6):
         set_first_count_to_one(page)
         check_all_checkboxes(page)
+        select_radios(page)
         if looks_like_grid(page):
             print(f"reached grid at step {step}")
             return True
